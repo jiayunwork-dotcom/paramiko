@@ -41,6 +41,7 @@ from paramiko.sftp import (
     CMD_ATTRS,
     CMD_FSETSTAT,
     CMD_EXTENDED,
+    SFTP_EXT_FSYNC,
     int64,
 )
 from paramiko.sftp_attr import SFTPAttributes
@@ -177,7 +178,7 @@ class SFTPFile(BufferedFile):
         return prefetch
 
     def _read(self, size):
-        size = min(size, self.MAX_REQUEST_SIZE)
+        size = min(size, self.sftp._request_size_limit("max_read_length"))
         if self._prefetching:
             data = self._read_prefetch(size)
             if data is not None:
@@ -191,7 +192,9 @@ class SFTPFile(BufferedFile):
 
     def _write(self, data):
         # may write less than requested if it would exceed max packet size
-        chunk = min(len(data), self.MAX_REQUEST_SIZE)
+        chunk = min(
+            len(data), self.sftp._request_size_limit("max_write_length")
+        )
         sftp_async_request = self.sftp._async_request(
             type(None),
             CMD_WRITE,
@@ -355,6 +358,28 @@ class SFTPFile(BufferedFile):
         attr.st_size = size
         self.sftp._request(CMD_FSETSTAT, self.handle, attr)
 
+    def fsync(self):
+        """
+        Ask the server to flush this open file's buffered data out to disk,
+        via the ``fsync@openssh.com`` SFTP extension (the equivalent of
+        ``fsync(2)``).
+
+        Locally buffered writes are flushed first, so the fsync reaches the
+        server only once all pending write requests have been sent.
+
+        :raises:
+            ``IOError`` -- if the server doesn't advertise the
+            ``fsync@openssh.com`` extension (in which case no request is
+            sent), or the request fails
+        """
+        self.flush()
+        self.sftp._log(DEBUG, "fsync({})".format(u(hexlify(self.handle))))
+        if SFTP_EXT_FSYNC not in self.sftp._extensions:
+            raise IOError(
+                "Server does not support fsync@openssh.com extension"
+            )
+        self.sftp._request(CMD_EXTENDED, SFTP_EXT_FSYNC, self.handle)
+
     def check(self, hash_algorithm, offset=0, length=0, block_size=0):
         """
         Ask the server for a hash of a section of this file.  This can be used
@@ -474,8 +499,9 @@ class SFTPFile(BufferedFile):
         # queue up async reads for the rest of the file
         chunks = []
         n = self._realpos
+        max_size = self.sftp._request_size_limit("max_read_length")
         while n < file_size:
-            chunk = min(self.MAX_REQUEST_SIZE, file_size - n)
+            chunk = min(max_size, file_size - n)
             chunks.append((n, chunk))
             n += chunk
         if len(chunks) > 0:
@@ -514,8 +540,9 @@ class SFTPFile(BufferedFile):
                 continue
 
             # break up anything larger than the max read size
+            max_size = self.sftp._request_size_limit("max_read_length")
             while size > 0:
-                chunk_size = min(size, self.MAX_REQUEST_SIZE)
+                chunk_size = min(size, max_size)
                 read_chunks.append((offset, chunk_size))
                 offset += chunk_size
                 size -= chunk_size

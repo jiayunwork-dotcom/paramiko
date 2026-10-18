@@ -173,6 +173,35 @@ class SFTPServerInterface:
         """
         return SFTP_OP_UNSUPPORTED
 
+    def statvfs(self, path):
+        """
+        Return an object describing the filesystem that ``path`` resides on,
+        or an error code.  This is the server-side callback for the
+        ``statvfs@openssh.com`` SFTP extension.
+
+        The returned object must expose the same attributes as the result of
+        Python's ``os.statvfs``: ``f_bsize``, ``f_frsize``, ``f_blocks``,
+        ``f_bfree``, ``f_bavail``, ``f_files``, ``f_ffree``, ``f_favail``,
+        ``f_fsid``, ``f_flag`` and ``f_namemax``.  The object's type is not
+        restricted -- an actual `os.statvfs_result` object works fine.
+
+        On failure, an SFTP error code such as ``SFTP_PERMISSION_DENIED``
+        should be returned instead.
+
+        .. note::
+            This extension is only advertised to clients when this method is
+            overridden in a `.SFTPServerInterface` subclass; the default
+            implementation reports ``SFTP_OP_UNSUPPORTED``.
+
+        :param str path:
+            the requested path (relative or absolute) to fetch filesystem
+            information for.
+        :return:
+            an object with the 11 ``os.statvfs`` attributes, or an SFTP error
+            code.
+        """
+        return SFTP_OP_UNSUPPORTED
+
     def remove(self, path):
         """
         Delete a file, if possible.
@@ -265,6 +294,28 @@ class SFTPServerInterface:
         """
         return SFTP_OP_UNSUPPORTED
 
+    def lsetstat(self, path, attr):
+        """
+        Change the attributes of a symbolic link itself, without following
+        the link.  This is the server-side callback for the
+        ``lsetstat@openssh.com`` SFTP extension and is otherwise identical
+        to `chattr` (which corresponds to the regular ``setstat`` request
+        and therefore follows symbolic links).
+
+        .. note::
+            This extension is only advertised to clients when this method is
+            overridden in a `.SFTPServerInterface` subclass; the default
+            implementation reports ``SFTP_OP_UNSUPPORTED``.
+
+        :param str path:
+            requested path (relative or absolute) of the symbolic link to
+            change.
+        :param .SFTPAttributes attr:
+            requested attributes to change on the symbolic link.
+        :return: an error code `int` like ``SFTP_OK``.
+        """
+        return SFTP_OP_UNSUPPORTED
+
     def canonicalize(self, path):
         """
         Return the canonical form of a path on the server.  For example,
@@ -314,3 +365,37 @@ class SFTPServerInterface:
         :return: an error code `int` like ``SFTP_OK``.
         """
         return SFTP_OP_UNSUPPORTED
+
+    def limits(self):
+        """
+        Return the server's preferred SFTP operational limits, or an error
+        code.  This is the server-side callback for the
+        ``limits@openssh.com`` SFTP extension.
+
+        The returned object must expose the attributes
+        ``max_packet_length``, ``max_read_length``, ``max_write_length`` and
+        ``max_open_handles``; its type is not restricted.  A value of zero
+        for any of these means the server imposes no explicit limit for it.
+
+        On failure, an SFTP error code such as ``SFTP_PERMISSION_DENIED``
+        should be returned instead.
+
+        .. note::
+            This extension is only advertised to clients when this method is
+            overridden in a `.SFTPServerInterface` subclass; the default
+            implementation reports ``SFTP_OP_UNSUPPORTED``.
+
+        :return:
+            an object with the four ``limits`` attributes, or an SFTP error
+            code.
+        """
+        return SFTP_OP_UNSUPPORTED
+
+    def supports_fsync(self):
+        """
+        Report whether the file handles served by this interface can honor
+        ``fsync@openssh.com`` requests.  Return `True` to advertise the
+        ``fsync`` extension to clients (and make `.SFTPHandle.fsync` calls
+        possible); the default returns `False`.
+        """
+        return False

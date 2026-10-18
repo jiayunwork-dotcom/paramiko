@@ -21,12 +21,15 @@ A stub SFTP server for loopback SFTP testing.
 """
 
 import os
+import sys
 
 from paramiko import (
     AUTH_SUCCESSFUL,
     OPEN_SUCCEEDED,
     SFTPAttributes,
     SFTPHandle,
+    SFTPLimits,
+    SFTPStatVFS,
     SFTPServer,
     SFTPServerInterface,
     SFTP_FAILURE,
@@ -57,6 +60,13 @@ class StubSFTPHandle(SFTPHandle):
         # use the stored filename
         try:
             SFTPServer.set_file_attr(self.filename, attr)
+            return SFTP_OK
+        except OSError as e:
+            return SFTPServer.convert_errno(e.errno)
+
+    def fsync(self):
+        try:
+            os.fsync(self.readfile.fileno())
             return SFTP_OK
         except OSError as e:
             return SFTPServer.convert_errno(e.errno)
@@ -99,6 +109,18 @@ class StubSFTPServer(SFTPServerInterface):
             return SFTPAttributes.from_stat(os.lstat(path))
         except OSError as e:
             return SFTPServer.convert_errno(e.errno)
+
+    def statvfs(self, path):
+        path = self._realpath(path)
+        try:
+            st = os.statvfs(path)
+        except OSError as e:
+            return SFTPServer.convert_errno(e.errno)
+        # the extension always carries these 11 fields in this order; read
+        # them by name because, on Python 3.14+, f_fsid is no longer part of
+        # the os.statvfs_result tuple itself
+        values = [getattr(st, name) for name in SFTPStatVFS._fields]
+        return SFTPStatVFS(values)
 
     def open(self, path, flags, attr):
         path = self._realpath(path)
@@ -193,6 +215,33 @@ class StubSFTPServer(SFTPServerInterface):
         except OSError as e:
             return SFTPServer.convert_errno(e.errno)
         return SFTP_OK
+
+    def lsetstat(self, path, attr):
+        path = self._realpath(path)
+        try:
+            if sys.platform != "win32":
+                if attr._flags & attr.FLAG_PERMISSIONS and hasattr(
+                    os, "lchmod"
+                ):
+                    os.lchmod(path, attr.st_mode)
+                if attr._flags & attr.FLAG_UIDGID:
+                    os.lchown(path, attr.st_uid, attr.st_gid)
+            if attr._flags & attr.FLAG_AMTIME:
+                os.utime(
+                    path,
+                    (attr.st_atime, attr.st_mtime),
+                    follow_symlinks=False,
+                )
+        except OSError as e:
+            return SFTPServer.convert_errno(e.errno)
+        return SFTP_OK
+
+    def limits(self):
+        # zero means "no explicit limit" for each field
+        return SFTPLimits(0, 0, 0, 0)
+
+    def supports_fsync(self):
+        return True
 
     def symlink(self, target_path, path):
         path = self._realpath(path)

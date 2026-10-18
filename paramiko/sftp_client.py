@@ -19,6 +19,7 @@
 
 from binascii import hexlify
 import errno
+import operator
 import os
 import stat
 import threading
@@ -56,10 +57,14 @@ from paramiko.sftp import (
     CMD_REALPATH,
     CMD_STATUS,
     CMD_EXTENDED,
+    CMD_EXTENDED_REPLY,
     SFTP_OK,
     SFTP_EOF,
     SFTP_NO_SUCH_FILE,
     SFTP_PERMISSION_DENIED,
+    SFTP_EXT_STATVFS,
+    SFTP_EXT_LIMITS,
+    SFTP_EXT_LSETSTAT,
     int64,
 )
 
@@ -85,6 +90,116 @@ def _to_unicode(s):
 
 
 b_slash = b"/"
+
+
+# Result of a statvfs@openssh.com request: an 11-field tuple carrying the
+# same field names as a classic os.statvfs_result (f_bsize ... f_namemax,
+# including f_fsid).  It's defined explicitly instead of aliasing
+# os.statvfs_result because the on-the-wire extension always carries all 11
+# unsigned 64-bit fields -- e.g. Python 3.14 dropped "f_fsid" from its own
+# os.statvfs_result, and Windows never had one at all.
+class SFTPStatVFS(tuple):
+    """
+    Result of a ``statvfs@openssh.com`` request, mirroring the 11 fields of
+    `os.statvfs` (named attributes plus tuple indexing).
+    """
+
+    __slots__ = ()
+
+    # field names in wire/os.statvfs order
+    _fields = (
+        "f_bsize",
+        "f_frsize",
+        "f_blocks",
+        "f_bfree",
+        "f_bavail",
+        "f_files",
+        "f_ffree",
+        "f_favail",
+        "f_fsid",
+        "f_flag",
+        "f_namemax",
+    )
+
+    f_bsize = property(operator.itemgetter(0))
+    f_frsize = property(operator.itemgetter(1))
+    f_blocks = property(operator.itemgetter(2))
+    f_bfree = property(operator.itemgetter(3))
+    f_bavail = property(operator.itemgetter(4))
+    f_files = property(operator.itemgetter(5))
+    f_ffree = property(operator.itemgetter(6))
+    f_favail = property(operator.itemgetter(7))
+    f_fsid = property(operator.itemgetter(8))
+    f_flag = property(operator.itemgetter(9))
+    f_namemax = property(operator.itemgetter(10))
+
+    def __repr__(self):
+        return "SFTPStatVFS({})".format(
+            ", ".join(
+                "{}={!r}".format(name, self[i])
+                for i, name in enumerate(self._fields)
+            )
+        )
+
+
+class SFTPLimits:
+    """
+    Result of a ``limits@openssh.com`` request: the operational limits a
+    server asks the client to honor.  A value of zero for any of the fields
+    means the server imposes no explicit limit for that item.
+    """
+
+    __slots__ = (
+        "max_open_handles",
+        "max_packet_length",
+        "max_read_length",
+        "max_write_length",
+    )
+
+    def __init__(
+        self,
+        max_packet_length,
+        max_read_length,
+        max_write_length,
+        max_open_handles,
+    ):
+        self.max_packet_length = max_packet_length
+        self.max_read_length = max_read_length
+        self.max_write_length = max_write_length
+        self.max_open_handles = max_open_handles
+
+    def __repr__(self):
+        return (
+            "SFTPLimits(max_packet_length={!r}, max_read_length={!r}, "
+            "max_write_length={!r}, max_open_handles={!r})".format(
+                self.max_packet_length,
+                self.max_read_length,
+                self.max_write_length,
+                self.max_open_handles,
+            )
+        )
+
+    def __eq__(self, other):
+        return (
+            type(self) is type(other)
+            and self.max_packet_length == other.max_packet_length
+            and self.max_read_length == other.max_read_length
+            and self.max_write_length == other.max_write_length
+            and self.max_open_handles == other.max_open_handles
+        )
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(
+            (
+                self.max_packet_length,
+                self.max_read_length,
+                self.max_write_length,
+                self.max_open_handles,
+            )
+        )
 
 
 class SFTPClient(BaseSFTP, ClosingContextManager):
@@ -119,6 +234,11 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         self._cwd = None
         # request # -> SFTPFile
         self._expecting = weakref.WeakValueDictionary()
+        # extensions advertised by the server: name -> extension data
+        self._extensions = {}
+        # server limits fetched via the limits@openssh.com extension, or
+        # None when the extension isn't available/was refused
+        self._limits = None
         if type(sock) is Channel:
             # override default logger
             transport = self.sock.get_transport()
@@ -127,7 +247,7 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             )
             self.ultra_debug = transport.get_hexdump()
         try:
-            server_version = self._send_version()
+            server_version, self._extensions = self._send_version()
         except EOFError:
             raise SSHException("EOF during negotiation")
         self._log(
@@ -136,6 +256,14 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
                 server_version
             ),
         )
+        if SFTP_EXT_LIMITS in self._extensions:
+            # ask the server up front how big read/write requests may be, so
+            # files opened later honor the limits; a refusal just leaves the
+            # fixed SFTPFile.MAX_REQUEST_SIZE in effect.
+            try:
+                self._limits = self.limits()
+            except IOError:
+                self._limits = None
 
     @classmethod
     def from_transport(cls, t, window_size=None, max_packet_size=None):
@@ -513,6 +641,39 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
             raise SFTPError("Expected attributes")
         return SFTPAttributes._from_msg(msg)
 
+    def statvfs(self, path):
+        """
+        Retrieve information about the filesystem on the remote server that
+        contains the given ``path``, using the ``statvfs@openssh.com`` SFTP
+        extension.  The returned object has the same fields as the result of
+        Python's `os.statvfs`: ``f_bsize``, ``f_frsize``, ``f_blocks``,
+        ``f_bfree``, ``f_bavail``, ``f_files``, ``f_ffree``, ``f_favail``,
+        ``f_fsid``, ``f_flag`` and ``f_namemax`` (where supported, it is even
+        the same tuple-based object type).
+
+        All fields are transferred as 64-bit values, so values larger than
+        32 bits are preserved.
+
+        :param str path: the path of any file on the filesystem to query
+        :return:
+            an `os.statvfs_result`-like object describing the filesystem
+
+        :raises:
+            ``IOError`` -- if the server doesn't advertise the
+            ``statvfs@openssh.com`` extension (in which case no request is
+            sent), or the request fails
+        """
+        path = self._adjust_cwd(path)
+        self._log(DEBUG, "statvfs({!r})".format(path))
+        if SFTP_EXT_STATVFS not in self._extensions:
+            raise IOError(
+                "Server does not support statvfs@openssh.com extension"
+            )
+        t, msg = self._request(CMD_EXTENDED, SFTP_EXT_STATVFS, path)
+        if t != CMD_EXTENDED_REPLY:
+            raise SFTPError("Expected extended reply")
+        return SFTPStatVFS(msg.get_int64() for _ in range(11))
+
     def symlink(self, source, dest):
         """
         Create a symbolic link to the ``source`` path at ``destination``.
@@ -594,6 +755,31 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         attr.st_size = size
         self._request(CMD_SETSTAT, path, attr)
 
+    def lsetstat(self, path, attr):
+        """
+        Set the attributes of a symbolic link itself, without following the
+        link, using the ``lsetstat@openssh.com`` SFTP extension.  This is the
+        symbolic-link counterpart of the regular ``setstat`` request used by
+        `chmod`, `chown`, `utime` and `truncate`; unlike those methods it is
+        never substituted for by a regular setstat.
+
+        :param str path: path of the symbolic link whose attributes are set
+        :param .SFTPAttributes attr:
+            an `.SFTPAttributes` object describing the attributes to change
+
+        :raises:
+            ``IOError`` -- if the server doesn't advertise the
+            ``lsetstat@openssh.com`` extension (in which case no request is
+            sent), or the request fails
+        """
+        path = self._adjust_cwd(path)
+        self._log(DEBUG, "lsetstat({!r})".format(path))
+        if SFTP_EXT_LSETSTAT not in self._extensions:
+            raise IOError(
+                "Server does not support lsetstat@openssh.com extension"
+            )
+        self._request(CMD_EXTENDED, SFTP_EXT_LSETSTAT, path, attr)
+
     def readlink(self, path):
         """
         Return the target of a symbolic link (shortcut).  You can use
@@ -671,6 +857,41 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         """
         # TODO: make class initialize with self._cwd set to self.normalize('.')
         return self._cwd and u(self._cwd)
+
+    def limits(self):
+        """
+        Ask the server for its preferred SFTP operational limits, using the
+        ``limits@openssh.com`` extension.  The returned object exposes
+        ``max_packet_length``, ``max_read_length``, ``max_write_length`` and
+        ``max_open_handles``; a value of zero for any of them means the
+        server sets no explicit limit for that item.
+
+        When the server advertises this extension, it's also queried
+        automatically while opening the session, and subsequent file reads
+        and writes stay within the returned read/write limits (and never
+        exceed the built-in 32768-byte request size).
+
+        :return: an `.SFTPLimits` object with the four limits
+
+        :raises:
+            ``IOError`` -- if the server doesn't advertise the
+            ``limits@openssh.com`` extension (in which case no request is
+            sent), or the request fails
+        """
+        self._log(DEBUG, "limits()")
+        if SFTP_EXT_LIMITS not in self._extensions:
+            raise IOError(
+                "Server does not support limits@openssh.com extension"
+            )
+        t, msg = self._request(CMD_EXTENDED, SFTP_EXT_LIMITS)
+        if t != CMD_EXTENDED_REPLY:
+            raise SFTPError("Expected extended reply")
+        return SFTPLimits(
+            msg.get_int64(),
+            msg.get_int64(),
+            msg.get_int64(),
+            msg.get_int64(),
+        )
 
     def _transfer_with_callback(self, reader, writer, file_size, callback):
         size = 0
@@ -955,6 +1176,21 @@ class SFTPClient(BaseSFTP, ClosingContextManager):
         if self._cwd == b_slash:
             return self._cwd + path
         return self._cwd + b_slash + path
+
+    def _request_size_limit(self, field):
+        """
+        Maximum size (in bytes) of a single read/write request, honoring a
+        server-advertised ``limits@openssh.com`` result while never
+        exceeding `.SFTPFile.MAX_REQUEST_SIZE`.  A zero limit (or no limits
+        extension / a refused limits request) means the fixed
+        ``MAX_REQUEST_SIZE`` is used.
+        """
+        size = SFTPFile.MAX_REQUEST_SIZE
+        if self._limits is not None:
+            limit = getattr(self._limits, field, 0)
+            if limit:
+                size = min(size, limit)
+        return size
 
 
 class SFTP(SFTPClient):

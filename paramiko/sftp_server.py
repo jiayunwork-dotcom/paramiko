@@ -71,6 +71,10 @@ from paramiko.sftp import (
     SFTP_OK,
     SFTP_OP_UNSUPPORTED,
     SFTP_PERMISSION_DENIED,
+    SFTP_EXT_FSYNC,
+    SFTP_EXT_STATVFS,
+    SFTP_EXT_LIMITS,
+    SFTP_EXT_LSETSTAT,
     BaseSFTP,
     Message,
     int64,
@@ -81,6 +85,30 @@ from paramiko.util import b
 
 # TODO: nuke or update w/ newer algs, see below
 _hash_class = {"sha1": sha1, "md5": md5}
+
+# fields (in wire order) of a statvfs@openssh.com extended reply; these are
+# the same names os.statvfs uses.
+_statvfs_fields = (
+    "f_bsize",
+    "f_frsize",
+    "f_blocks",
+    "f_bfree",
+    "f_bavail",
+    "f_files",
+    "f_ffree",
+    "f_favail",
+    "f_fsid",
+    "f_flag",
+    "f_namemax",
+)
+
+# fields (in wire order) of a limits@openssh.com extended reply
+_limits_fields = (
+    "max_packet_length",
+    "max_read_length",
+    "max_write_length",
+    "max_open_handles",
+)
 
 
 class SFTPServer(BaseSFTP, SubsystemHandler):
@@ -130,6 +158,23 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
                 super()._log(level, "[chan " + self.sock.get_name() + "] " + m)
         else:
             super()._log(level, "[chan " + self.sock.get_name() + "] " + msg)
+
+    def _send_server_version(self):
+        # "check-file" is always advertised (as before); the OpenSSH
+        # extensions are advertised only when the server interface actually
+        # implements the corresponding hook, using the version strings from
+        # OpenSSH's PROTOCOL document.
+        extension_pairs = ["check-file", "md5,sha1"]
+        interface = type(self.server)
+        if interface.statvfs is not SFTPServerInterface.statvfs:
+            extension_pairs += [SFTP_EXT_STATVFS, "2"]
+        if interface.limits is not SFTPServerInterface.limits:
+            extension_pairs += [SFTP_EXT_LIMITS, "1"]
+        if interface.lsetstat is not SFTPServerInterface.lsetstat:
+            extension_pairs += [SFTP_EXT_LSETSTAT, "1"]
+        if self.server.supports_fsync():
+            extension_pairs += [SFTP_EXT_FSYNC, "1"]
+        return super()._send_server_version(extension_pairs)
 
     def start_subsystem(self, name, transport, channel):
         self.sock = channel
@@ -356,6 +401,41 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
         msg.add_bytes(sum_out)
         self._send_packet(CMD_EXTENDED_REPLY, msg)
 
+    def _send_extended_fields(self, request_number, resp, fields):
+        # statvfs/limits hooks return either an SFTP error code (an int) or
+        # an object carrying the result fields (its type is not restricted);
+        # pack the fields, in order, as unsigned 64-bit integers.
+        if isinstance(resp, int):
+            self._send_status(request_number, resp)
+            return
+        msg = Message()
+        msg.add_int(request_number)
+        for field in fields:
+            msg.add_int64(int(getattr(resp, field)))
+        self._send_packet(CMD_EXTENDED_REPLY, msg)
+
+    def _statvfs(self, request_number, msg):
+        path = msg.get_text()
+        self._send_extended_fields(
+            request_number, self.server.statvfs(path), _statvfs_fields
+        )
+
+    def _limits(self, request_number):
+        self._send_extended_fields(
+            request_number, self.server.limits(), _limits_fields
+        )
+
+    def _fsync(self, request_number, msg):
+        handle = msg.get_binary()
+        if handle not in self.file_table:
+            # an invalid handle is just an error status -- the session stays
+            # usable
+            self._send_status(
+                request_number, SFTP_BAD_MESSAGE, "Invalid handle"
+            )
+            return
+        self._send_status(request_number, self.file_table[handle].fsync())
+
     def _convert_pflags(self, pflags):
         """convert SFTP-style open() flags to Python's os.open() flags"""
         if (pflags & SFTP_FLAG_READ) and (pflags & SFTP_FLAG_WRITE):
@@ -529,6 +609,20 @@ class SFTPServer(BaseSFTP, SubsystemHandler):
                 self._send_status(
                     request_number, self.server.posix_rename(oldpath, newpath)
                 )
+            elif tag == SFTP_EXT_STATVFS:
+                self._statvfs(request_number, msg)
+            elif tag == SFTP_EXT_LIMITS:
+                self._limits(request_number)
+            elif tag == SFTP_EXT_LSETSTAT:
+                path = msg.get_text()
+                attr = SFTPAttributes._from_msg(msg)
+                # like setstat, but the hook acts on the link itself rather
+                # than being routed through chattr()/following the link
+                self._send_status(
+                    request_number, self.server.lsetstat(path, attr)
+                )
+            elif tag == SFTP_EXT_FSYNC:
+                self._fsync(request_number, msg)
             else:
                 self._send_status(request_number, SFTP_OP_UNSUPPORTED)
         else:

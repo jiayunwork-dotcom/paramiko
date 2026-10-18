@@ -167,6 +167,21 @@ class SFTPHandle(ClosingContextManager):
         """
         return SFTP_OP_UNSUPPORTED
 
+    def fsync(self):
+        """
+        Force any buffered data for this file out to stable storage, the
+        way ``fsync(2)`` does.  This is called when a client issues an
+        ``fsync@openssh.com`` extended request on this handle.
+
+        Override this method to sync the underlying file (for example by
+        calling ``os.fsync`` on its file descriptor).  The server interface's
+        `.SFTPServerInterface.supports_fsync` method must also be overridden
+        to return `True` before the extension is advertised to clients.
+
+        :return: an `int` error code like ``SFTP_OK``.
+        """
+        return SFTP_OP_UNSUPPORTED
+
     # ...internals...
 
     def _set_files(self, files):

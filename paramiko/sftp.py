@@ -83,6 +83,14 @@ SFTP_FLAG_EXCL = 0x20
 
 _VERSION = 3
 
+# OpenSSH SFTP extension names (see the "SFTP protocol changes" section of
+# OpenSSH's PROTOCOL file).  The version strings advertised in the
+# SSH_FXP_VERSION packet for each extension are also kept here.
+SFTP_EXT_FSYNC = "fsync@openssh.com"
+SFTP_EXT_STATVFS = "statvfs@openssh.com"
+SFTP_EXT_LIMITS = "limits@openssh.com"
+SFTP_EXT_LSETSTAT = "lsetstat@openssh.com"
+
 
 # for debugging
 CMD_NAMES = {
@@ -148,17 +156,25 @@ class BaseSFTP:
         version = struct.unpack(">I", data[:4])[0]
         #        if version != _VERSION:
         #            raise SFTPError('Incompatible sftp protocol')
-        return version
+        # the version packet may be followed by pairs of extension
+        # name/extension data strings advertised by the server
+        msg = Message(data[4:])
+        extensions = {}
+        while len(msg.get_remainder()) > 0:
+            name = msg.get_text()
+            ext_data = msg.get_text()
+            extensions[name] = ext_data
+        return version, extensions
 
-    def _send_server_version(self):
+    def _send_server_version(self, extension_pairs=("check-file", "md5,sha1")):
         # winscp will freak out if the server sends version info before the
         # client finishes sending INIT.
         t, data = self._read_packet()
         if t != CMD_INIT:
             raise SFTPError("Incompatible sftp protocol")
         version = struct.unpack(">I", data[:4])[0]
-        # advertise that we support "check-file"
-        extension_pairs = ["check-file", "md5,sha1"]
+        # advertise the extensions passed in by the caller (the default is
+        # "check-file", which we've always supported)
         msg = Message()
         msg.add_int(_VERSION)
         msg.add(*extension_pairs)
