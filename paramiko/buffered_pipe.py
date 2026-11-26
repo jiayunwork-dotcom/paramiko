@@ -43,12 +43,16 @@ class BufferedPipe:
     `.Channel`.
     """
 
-    def __init__(self):
+    def __init__(self, on_read=None):
         self._lock = threading.Lock()
         self._cv = threading.Condition(self._lock)
         self._event = None
         self._buffer = array.array("B")
         self._closed = False
+        # Optional accounting hook.  It is invoked while this pipe's lock is
+        # held, immediately after bytes have been removed, so buffer removal
+        # and capacity release cannot be observed as separate states.
+        self._on_read = on_read
 
     def _buffer_frombytes(self, data):
         self._buffer.frombytes(data)
@@ -79,19 +83,30 @@ class BufferedPipe:
         finally:
             self._lock.release()
 
-    def feed(self, data):
+    def feed(self, data, validator=None):
         """
         Feed new data into this pipe.  This method is assumed to be called
         from a separate thread, so synchronization is done.
 
         :param data: the data to add, as a ``str`` or ``bytes``
+        :param validator: optional callable invoked with the payload length
+            while the pipe lock is held and before the buffer grows.  It may
+            raise to reject the data.  It may return ``"discard"`` to skip
+            adding the bytes after validation.
         """
         self._lock.acquire()
         try:
+            data = b(data)
+            disposition = None
+            if validator is not None:
+                disposition = validator(len(data))
+            if disposition == "discard":
+                return disposition
             if self._event is not None:
                 self._event.set()
-            self._buffer_frombytes(b(data))
+            self._buffer_frombytes(data)
             self._cv.notify_all()
+            return "feed"
         finally:
             self._lock.release()
 
@@ -156,20 +171,29 @@ class BufferedPipe:
             # something's in the buffer and we have the lock!
             if len(self._buffer) <= nbytes:
                 out = self._buffer_tobytes()
+                removed = len(self._buffer)
                 del self._buffer[:]
                 if (self._event is not None) and not self._closed:
                     self._event.clear()
             else:
                 out = self._buffer_tobytes(nbytes)
+                removed = nbytes
                 del self._buffer[:nbytes]
+            if removed and self._on_read is not None:
+                self._on_read(removed)
         finally:
             self._lock.release()
 
         return out
 
-    def empty(self):
+    def empty(self, notify=True):
         """
         Clear out the buffer and return all data that was in it.
+
+        :param bool notify: when true (the default), invoke the read
+            accounting hook for removed bytes.  Internal stream-merging code
+            may pass false because the bytes are moved to another pipe on the
+            same channel rather than consumed by the application.
 
         :return:
             any data that was in the buffer prior to clearing it out, as a
@@ -178,9 +202,12 @@ class BufferedPipe:
         self._lock.acquire()
         try:
             out = self._buffer_tobytes()
+            removed = len(self._buffer)
             del self._buffer[:]
             if (self._event is not None) and not self._closed:
                 self._event.clear()
+            if notify and removed and self._on_read is not None:
+                self._on_read(removed)
             return out
         finally:
             self._lock.release()

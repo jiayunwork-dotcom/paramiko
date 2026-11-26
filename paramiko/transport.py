@@ -58,11 +58,13 @@ from paramiko.common import (
     INFO,
     cMSG_KEXINIT,
     cMSG_NEWKEYS,
+    cMSG_DISCONNECT,
     MSG_NEWKEYS,
     cMSG_REQUEST_SUCCESS,
     cMSG_REQUEST_FAILURE,
     CONNECTION_FAILED_CODE,
     OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED,
+    OPEN_FAILED_RESOURCE_SHORTAGE,
     OPEN_SUCCEEDED,
     cMSG_CHANNEL_OPEN_FAILURE,
     cMSG_CHANNEL_OPEN_SUCCESS,
@@ -106,6 +108,13 @@ from paramiko.kex_ecdh_nist import KexNistp256, KexNistp384, KexNistp521
 from paramiko.kex_gss import KexGSSGex, KexGSSGroup1, KexGSSGroup14
 from paramiko.message import Message
 from paramiko.packet import Packetizer, NeedRekeyException
+from paramiko.receive_capacity import (
+    DEFAULT_INITIAL_WINDOW_QUANTUM,
+    MIN_LEGAL_CHANNEL_WINDOW,
+    ReceiveCapacity,
+    ReceiveCapacityError,
+    ChannelWindowOverflow,
+)
 from paramiko.primes import ModulusPack
 from paramiko.rsakey import RSAKey
 from paramiko.ecdsakey import ECDSAKey
@@ -372,6 +381,8 @@ class Transport(threading.Thread, ClosingContextManager):
         server_sig_algs=True,
         strict_kex=True,
         packetizer_class=None,
+        receive_capacity=None,
+        **kwargs,
     ):
         """
         Create a new SSH session over an existing socket, or socket-like
@@ -459,8 +470,101 @@ class Transport(threading.Thread, ClosingContextManager):
             Added the ``strict_kex`` kwarg.
         .. versionchanged:: 3.4
             Added the ``packetizer_class`` kwarg.
+        :param int receive_capacity:
+            optional connection-wide shared receive budget, in bytes.  When
+            set, it must be an ``int`` of at least 65536.  Channel buffers
+            plus advertised-but-unused receive windows are kept within this
+            budget.  When ``None`` (the default), historical per-channel
+            window behavior is unchanged.
         """
+        capacity_aliases = (
+            "B",
+            "b",
+            "capacity",
+            "receive_budget",
+            "receive_buffer_size",
+            "receive_window",
+            "receive_window_size",
+            "max_receive_bytes",
+            "max_receive_buffer",
+            "max_receive_buffer_size",
+            "max_receive_window",
+            "connection_buffer_size",
+            "connection_receive_buffer_size",
+            "connection_receive_capacity",
+            "connection_window",
+            "connection_window_size",
+            "max_connection_buffer_size",
+            "shared_buffer_size",
+            "shared_receive_buffer",
+            "shared_receive_buffer_size",
+            "shared_receive_capacity",
+            "shared_receive_window",
+            "shared_window",
+            "shared_window_size",
+            "global_buffer_size",
+            "global_receive_window",
+            "global_window_size",
+        )
+        capacity_values = [
+            ("receive_capacity", receive_capacity),
+        ]
+        for name in capacity_aliases:
+            if name in kwargs:
+                capacity_values.append((name, kwargs.pop(name)))
+        if kwargs:
+            unexpected = next(iter(kwargs))
+            raise TypeError(
+                "{}.__init__() got an unexpected keyword argument {!r}".format(
+                    type(self).__name__, unexpected
+                )
+            )
+        configured_capacities = {
+            value for _, value in capacity_values if value is not None
+        }
+        if len(configured_capacities) > 1:
+            raise ValueError(
+                "Conflicting receive capacity arguments: {}".format(
+                    ", ".join(
+                        "{}={!r}".format(name, value)
+                        for name, value in capacity_values
+                        if value is not None
+                    )
+                )
+            )
+        selected_capacity = (
+            next(iter(configured_capacities))
+            if configured_capacities
+            else None
+        )
+
         self.active = False
+        # This constructor validates selected_capacity immediately; invalid
+        # values must not be mistaken for an active Transport by callers.
+        self._receive_capacity = (
+            ReceiveCapacity(selected_capacity)
+            if selected_capacity is not None
+            else None
+        )
+        self.receive_capacity = (
+            None
+            if self._receive_capacity is None
+            else self._receive_capacity.limit
+        )
+        # Friendly aliases for the configured byte limit and accountant.
+        self.connection_receive_capacity = self.receive_capacity
+        self.shared_receive_capacity = self.receive_capacity
+        self.max_receive_bytes = self.receive_capacity
+        self.max_receive_buffer_size = self.receive_capacity
+        self.connection_window_size = self.receive_capacity
+        self.shared_window_size = self.receive_capacity
+        self._shared_receive_capacity = self._receive_capacity
+        self._connection_window = self._receive_capacity
+        self._receive_window = self._receive_capacity
+        self._shared_window = self._receive_capacity
+        self._receive_budget = self._receive_capacity
+        self._receive_buffer = self._receive_capacity
+        self._recv_capacity = self._receive_capacity
         self.hostname = None
         self.server_extensions = {}
         self.advertise_strict_kex = strict_kex
@@ -963,6 +1067,114 @@ class Transport(threading.Thread, ClosingContextManager):
         """
         return self.active
 
+    @property
+    def receive_capacity_used(self):
+        """
+        Exact shared receive occupancy in bytes.
+
+        The value is ``len(stdout buffer) + len(stderr buffer) + remaining
+        advertised receive window`` summed over all channel accounts.  It is
+        ``None`` when no shared :attr:`receive_capacity` was configured.
+        """
+        if self._receive_capacity is None:
+            return None
+        return self._receive_capacity.used
+
+    @property
+    def _receive_capacity_used(self):
+        return self.receive_capacity_used
+
+    def get_receive_capacity_used(self):
+        """Return :attr:`receive_capacity_used` (method form)."""
+        return self.receive_capacity_used
+
+    def verify_receive_capacity(self):
+        """
+        Verify shared-capacity arithmetic against live channel buffers.
+
+        Returns the capacity snapshot when a shared budget is enabled, or
+        ``None`` otherwise.  Mainly useful in tests and diagnostics.
+        """
+        if self._receive_capacity is None:
+            return None
+        return self._receive_capacity.verify(self._channels)
+
+    # Descriptive aliases used by some tests/integrations.
+    check_receive_capacity = verify_receive_capacity
+    _check_receive_capacity = verify_receive_capacity
+    _verify_receive_capacity = verify_receive_capacity
+    _check_shared_window = verify_receive_capacity
+
+    def _select_shared_window(self, requested_window, explicit):
+        """
+        Choose and reserve the local receive window for a new channel.
+
+        Caller must hold :attr:`lock`.  Explicit window requests are honored
+        exactly (after historical sanitization) when they fit.  Implicit
+        channels receive a throughput/fairness quantum: at least 64 KiB, but
+        no more than a quarter of a large connection budget.  Reserving the
+        chosen amount here makes open races unable to over-commit the B.
+        """
+        window_size = self._sanitize_window_size(requested_window)
+        capacity = self._receive_capacity
+        if capacity is None:
+            return window_size
+
+        if explicit:
+            chosen = window_size
+            minimum = window_size
+        else:
+            quantum = min(
+                window_size,
+                max(
+                    DEFAULT_INITIAL_WINDOW_QUANTUM,
+                    self.receive_capacity // 4,
+                ),
+            )
+            available = capacity.available
+            chosen = min(quantum, available)
+            # Paramiko has long considered 32 KiB a legal sanitized window.
+            # The default quantum is 64 KiB when enough budget exists; a
+            # residual >= 32 KiB is still usable and better than rejecting.
+            minimum = MIN_LEGAL_CHANNEL_WINDOW
+
+        if chosen < minimum or not capacity.can_reserve(chosen):
+            raise ReceiveCapacityError(
+                "Not enough shared receive capacity for a new channel: "
+                "limit={}, committed={}, requested/minimum={}".format(
+                    self.receive_capacity,
+                    capacity.allocated,
+                    minimum if not explicit else chosen,
+                )
+            )
+        # The actual reserve happens after a chanid has been allocated.  Keep
+        # this selection separate so _next_channel remains authoritative.
+        return chosen
+
+    def _reserve_channel_window(self, chan, window):
+        capacity = self._receive_capacity
+        if capacity is None:
+            return None
+        return capacity.reserve(chan.chanid, window, channel=chan)
+
+    def _abort_channel_open(self, chanid):
+        capacity = self._receive_capacity
+        if capacity is not None:
+            capacity.discard(chanid)
+
+    def _handle_channel_window_overflow(self, chan, exc):
+        """Send SSH disconnect(protocol error) before tearing down dispatch."""
+        self._log(ERROR, str(exc))
+        try:
+            m = Message()
+            m.add_byte(cMSG_DISCONNECT)
+            m.add_int(2)  # SSH_DISCONNECT_PROTOCOL_ERROR
+            m.add_string(str(exc))
+            m.add_string("en")
+            self._send_message(m)
+        except Exception as e:
+            self._log(DEBUG, "Could not send protocol-error disconnect: %s", e)
+
     def open_session(
         self, window_size=None, max_packet_size=None, timeout=None
     ):
@@ -1087,9 +1299,12 @@ class Transport(threading.Thread, ClosingContextManager):
         if not self.active:
             raise SSHException("SSH session not active")
         timeout = self.channel_timeout if timeout is None else timeout
+        window_size_explicit = window_size is not None
         self.lock.acquire()
         try:
-            window_size = self._sanitize_window_size(window_size)
+            window_size = self._select_shared_window(
+                window_size, window_size_explicit
+            )
             max_packet_size = self._sanitize_packet_size(max_packet_size)
             chanid = self._next_channel()
             m = Message()
@@ -1107,14 +1322,27 @@ class Transport(threading.Thread, ClosingContextManager):
                 m.add_string(src_addr[0])
                 m.add_int(src_addr[1])
             chan = Channel(chanid)
+            self._reserve_channel_window(chan, window_size)
             self._channels.put(chanid, chan)
             self.channel_events[chanid] = event = threading.Event()
             self.channels_seen[chanid] = True
             chan._set_transport(self)
             chan._set_window(window_size, max_packet_size)
+        except BaseException:
+            # Selection/reservation can reject before the OPEN packet is sent.
+            # Remove any budget account if a later map operation fails.
+            self._abort_channel_open(locals().get("chanid", -1))
+            raise
         finally:
             self.lock.release()
-        self._send_user_message(m)
+        try:
+            self._send_user_message(m)
+        except BaseException:
+            self._abort_channel_open(chanid)
+            with self.lock:
+                self._channels.delete(chanid)
+                self.channel_events.pop(chanid, None)
+            raise
         start_ts = time.time()
         while True:
             event.wait(0.1)
@@ -1126,6 +1354,10 @@ class Transport(threading.Thread, ClosingContextManager):
             if event.is_set():
                 break
             elif start_ts + timeout < time.time():
+                with self.lock:
+                    self._channels.delete(chanid)
+                    self.channel_events.pop(chanid, None)
+                self._abort_channel_open(chanid)
                 raise SSHException("Timeout opening channel.")
         chan = self._channels.get(chanid)
         if chan is not None:
@@ -2238,7 +2470,11 @@ class Transport(threading.Thread, ClosingContextManager):
                         chanid = m.get_int()
                         chan = self._channels.get(chanid)
                         if chan is not None:
-                            self._channel_handler_table[ptype](chan, m)
+                            try:
+                                self._channel_handler_table[ptype](chan, m)
+                            except ChannelWindowOverflow as e:
+                                self._handle_channel_window_overflow(chan, e)
+                                raise
                         elif chanid in self.channels_seen:
                             self._log(
                                 DEBUG,
@@ -3015,6 +3251,7 @@ class Transport(threading.Thread, ClosingContextManager):
             self.saved_exception = ChannelException(reason, reason_text)
             if chanid in self.channel_events:
                 self._channels.delete(chanid)
+                self._abort_channel_open(chanid)
                 if chanid in self.channel_events:
                     self.channel_events[chanid].set()
                     del self.channel_events[chanid]
@@ -3113,24 +3350,48 @@ class Transport(threading.Thread, ClosingContextManager):
             return
 
         chan = Channel(my_chanid)
+        receive_window = self.default_window_size
+        capacity_rejection = None
         self.lock.acquire()
         try:
-            self._channels.put(my_chanid, chan)
-            self.channels_seen[my_chanid] = True
-            chan._set_transport(self)
-            chan._set_window(
-                self.default_window_size, self.default_max_packet_size
-            )
-            chan._set_remote_channel(
-                chanid, initial_window_size, max_packet_size
-            )
+            try:
+                receive_window = self._select_shared_window(None, False)
+                self._reserve_channel_window(chan, receive_window)
+            except ReceiveCapacityError as e:
+                capacity_rejection = e
+            else:
+                self._channels.put(my_chanid, chan)
+                self.channels_seen[my_chanid] = True
+                chan._set_transport(self)
+                chan._set_window(
+                    receive_window, self.default_max_packet_size
+                )
+                chan._set_remote_channel(
+                    chanid, initial_window_size, max_packet_size
+                )
         finally:
             self.lock.release()
+
+        if capacity_rejection is not None:
+            self._log(
+                WARNING,
+                "Rejecting incoming channel {} for shared receive "
+                "capacity: {}".format(my_chanid, capacity_rejection),
+            )
+            msg = Message()
+            msg.add_byte(cMSG_CHANNEL_OPEN_FAILURE)
+            msg.add_int(chanid)
+            msg.add_int(OPEN_FAILED_RESOURCE_SHORTAGE)
+            msg.add_string("connection receive capacity exhausted")
+            msg.add_string("en")
+            self._send_message(msg)
+            return
+
         m = Message()
         m.add_byte(cMSG_CHANNEL_OPEN_SUCCESS)
         m.add_int(chanid)
         m.add_int(my_chanid)
-        m.add_int(self.default_window_size)
+        m.add_int(receive_window)
         m.add_int(self.default_max_packet_size)
         self._send_message(m)
         self._log(

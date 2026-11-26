@@ -78,6 +78,12 @@ from paramiko.sftp_si import SFTPServerInterface
 from paramiko.sftp_file import SFTPFile
 from paramiko.message import Message
 from paramiko.packet import Packetizer
+from paramiko.receive_capacity import (
+    MIN_RECEIVE_CAPACITY,
+    ReceiveCapacity,
+    ReceiveCapacityError,
+    ChannelWindowOverflow,
+)
 from paramiko.file import BufferedFile
 from paramiko.agent import Agent, AgentKey
 from paramiko.pkey import PKey, PublicBlob, UnknownKeyType
@@ -129,6 +135,7 @@ __all__ = [
     "BufferedFile",
     "Channel",
     "ChannelException",
+    "ChannelWindowOverflow",
     "ConfigParseError",
     "CouldNotCanonicalize",
     "DSSKey",
@@ -137,11 +144,14 @@ __all__ = [
     "HostKeys",
     "Message",
     "MissingHostKeyPolicy",
+    "MIN_RECEIVE_CAPACITY",
     "PKey",
     "PasswordRequiredException",
     "ProxyCommand",
     "ProxyCommandFailure",
     "RSAKey",
+    "ReceiveCapacity",
+    "ReceiveCapacityError",
     "RejectPolicy",
     "SFTP",
     "SFTPAttributes",

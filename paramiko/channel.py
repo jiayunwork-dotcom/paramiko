@@ -25,6 +25,7 @@ import os
 import socket
 import time
 import threading
+import weakref
 
 from functools import wraps
 
@@ -109,8 +110,19 @@ class Channel(ClosingContextManager):
         self.active = False
         self.eof_received = 0
         self.eof_sent = 0
-        self.in_buffer = BufferedPipe()
-        self.in_stderr_buffer = BufferedPipe()
+
+        # Use a weak reference in the pipe hook.  A bound method would create
+        # a Channel -> BufferedPipe -> bound-method -> Channel cycle and delay
+        # reclamation of channels the application has dropped.
+        channel_ref = weakref.ref(self)
+
+        def _buffered_read_hook(nbytes):
+            channel = channel_ref()
+            if channel is not None:
+                Channel._on_buffered_read(channel, nbytes)
+
+        self.in_buffer = BufferedPipe(on_read=_buffered_read_hook)
+        self.in_stderr_buffer = BufferedPipe(on_read=_buffered_read_hook)
         self.timeout = None
         #: Whether the connection has been closed
         self.closed = False
@@ -118,6 +130,7 @@ class Channel(ClosingContextManager):
         self.lock = threading.Lock()
         self.out_buffer_cv = threading.Condition(self.lock)
         self.in_window_size = 0
+        self._in_window_remaining = 0
         self.out_window_size = 0
         self.in_max_packet_size = 0
         self.out_max_packet_size = 0
@@ -573,12 +586,16 @@ class Channel(ClosingContextManager):
             old = self.combine_stderr
             self.combine_stderr = combine
             if combine and not old:
-                # copy old stderr buffer into primary buffer
-                data = self.in_stderr_buffer.empty()
+                # copy old stderr buffer into primary buffer.  notify=False
+                # because this is a move between two pipes of one channel.
+                data = self.in_stderr_buffer.empty(notify=False)
         finally:
             self.lock.release()
         if len(data) > 0:
-            self._feed(data)
+            # The bytes were already admitted to the shared account while in
+            # stderr's pipe.  Move the Python bytes directly into stdout's pipe
+            # without admitting or reading them a second time.
+            self.in_buffer.feed(data)
         return old
 
     # ...socket API...
@@ -701,11 +718,7 @@ class Channel(ClosingContextManager):
         ack = self._check_add_window(len(out))
         # no need to hold the channel lock when sending this
         if ack > 0:
-            m = Message()
-            m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
-            m.add_int(self.remote_chanid)
-            m.add_int(ack)
-            self.transport._send_user_message(m)
+            self._send_window_adjustment(ack)
 
         return out
 
@@ -749,11 +762,7 @@ class Channel(ClosingContextManager):
         ack = self._check_add_window(len(out))
         # no need to hold the channel lock when sending this
         if ack > 0:
-            m = Message()
-            m.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
-            m.add_int(self.remote_chanid)
-            m.add_int(ack)
-            self.transport._send_user_message(m)
+            self._send_window_adjustment(ack)
 
         return out
 
@@ -996,12 +1005,97 @@ class Channel(ClosingContextManager):
 
     # ...calls from Transport
 
+    def _shared_capacity(self):
+        transport = self.transport
+        if transport is None:
+            return None
+        return getattr(transport, "_receive_capacity", None)
+
+    @property
+    def receive_capacity_enabled(self):
+        return self._shared_capacity() is not None
+
+    @property
+    def in_window_remaining(self):
+        """
+        Remaining local receive-window credit.
+
+        With a connection-wide capacity budget this is owned by the shared
+        accountant; otherwise Paramiko's legacy local counter is used.
+        """
+        capacity = self._shared_capacity()
+        if capacity is not None:
+            remaining = capacity.window(self.chanid)
+            if remaining is not None:
+                return remaining
+        return self._in_window_remaining
+
+    @in_window_remaining.setter
+    def in_window_remaining(self, value):
+        self._in_window_remaining = int(value)
+
+    def _on_buffered_read(self, nbytes):
+        # Called under BufferedPipe's lock.  It must not take Channel.lock.
+        capacity = self._shared_capacity()
+        if capacity is not None:
+            capacity.record_read(self.chanid, nbytes)
+
+    def _admit_received_payload(self, nbytes):
+        capacity = self._shared_capacity()
+        if capacity is not None:
+            # Raises before either BufferedPipe is fed when the peer exceeded
+            # the currently advertised channel window.  A "discard" result is
+            # for close/EOF grace bytes already covered by an old window.
+            return capacity.admit(self.chanid, nbytes)
+        self._in_window_remaining = max(
+            0, self._in_window_remaining - nbytes
+        )
+        return "feed"
+
+    def receive_occupancy(self):
+        """
+        Return a consistent payload/window occupancy snapshot for this channel.
+
+        The result is ``unread stdout + unread stderr + remaining advertised
+        receive window``.  Pipe locks are taken before the capacity lock,
+        matching feed/read lock order, so concurrent reads and packets cannot
+        produce a torn double-count.
+        """
+        stdout_lock = self.in_buffer._lock
+        stderr_lock = self.in_stderr_buffer._lock
+        stdout_lock.acquire()
+        try:
+            stderr_lock.acquire()
+            try:
+                buffered = len(self.in_buffer._buffer) + len(
+                    self.in_stderr_buffer._buffer
+                )
+                capacity = self._shared_capacity()
+                if capacity is None:
+                    return buffered + self._in_window_remaining
+                with capacity._lock:
+                    account = capacity._channels.get(self.chanid)
+                    if account is None:
+                        return buffered
+                    # Internal assertion-free coherent value.  account.buffered
+                    # is updated under the same pipe->capacity lock order.
+                    return buffered + account.window
+            finally:
+                stderr_lock.release()
+        finally:
+            stdout_lock.release()
+
+    def _shared_capacity_snapshot(self):
+        capacity = self._shared_capacity()
+        return None if capacity is None else capacity.snapshot()
+
     def _set_transport(self, transport):
         self.transport = transport
         self.logger = util.get_logger(self.transport.get_log_channel())
 
     def _set_window(self, window_size, max_packet_size):
         self.in_window_size = window_size
+        self.in_window_remaining = window_size
         self.in_max_packet_size = max_packet_size
         # threshold of bytes we receive before we bother to send
         # a window update
@@ -1042,7 +1136,10 @@ class Channel(ClosingContextManager):
             s = m
         else:
             s = m.get_binary()
-        self.in_buffer.feed(s)
+        # Admission runs as the BufferedPipe validator while its lock is held,
+        # before the bytearray grows.  A window violation propagates without
+        # feeding any bytes.
+        self.in_buffer.feed(s, validator=self._admit_received_payload)
 
     def _feed_extended(self, m):
         code = m.get_int()
@@ -1052,10 +1149,14 @@ class Channel(ClosingContextManager):
                 ERROR, "unknown extended_data type {}; discarding".format(code)
             )
             return
+        # stdout and stderr share one SSH channel window and one connection
+        # budget.  Use the destination pipe's validator so window admission
+        # and buffer growth are atomic under that pipe's lock.
+        validator = self._admit_received_payload
         if self.combine_stderr:
-            self._feed(s)
+            self.in_buffer.feed(s, validator=validator)
         else:
-            self.in_stderr_buffer.feed(s)
+            self.in_stderr_buffer.feed(s, validator=validator)
 
     def _window_adjust(self, m):
         nbytes = m.get_int()
@@ -1165,6 +1266,11 @@ class Channel(ClosingContextManager):
         try:
             if not self.eof_received:
                 self.eof_received = True
+                capacity = self._shared_capacity()
+                if capacity is not None:
+                    capacity.revoke_window(self.chanid)
+                else:
+                    self.in_window_remaining = 0
                 self.in_buffer.close()
                 self.in_stderr_buffer.close()
                 if self._pipe is not None:
@@ -1226,6 +1332,12 @@ class Channel(ClosingContextManager):
     def _set_closed(self):
         # you are holding the lock.
         self.closed = True
+        capacity = self._shared_capacity()
+        if capacity is not None:
+            # Idempotent; repeated close/unlink must not release twice.
+            capacity.revoke_window(self.chanid)
+        else:
+            self.in_window_remaining = 0
         self.in_buffer.close()
         self.in_stderr_buffer.close()
         self.out_buffer_cv.notify_all()
@@ -1287,9 +1399,45 @@ class Channel(ClosingContextManager):
                 )
             out = self.in_window_sofar
             self.in_window_sofar = 0
+            # The shared accountant already holds ``out`` in
+            # pending_adjust because the BufferedPipe read hook recorded the
+            # removed bytes.  It is committed to the advertised-window counter
+            # only after the WINDOW_ADJUST message has been handed off.
             return out
         finally:
             self.lock.release()
+
+    def _send_window_adjustment(self, amount):
+        if amount <= 0 or self.transport is None:
+            return
+        capacity = self._shared_capacity()
+        committed = amount
+        if capacity is not None:
+            # Commit before writing: over an in-process LoopSocket the peer
+            # can process the adjustment and return DATA before this call
+            # returns.  Committing first prevents rejecting that valid reply.
+            committed = capacity.flush_adjustment(self.chanid, amount)
+            if committed <= 0:
+                return
+        else:
+            self._in_window_remaining += amount
+
+        message = Message()
+        message.add_byte(cMSG_CHANNEL_WINDOW_ADJUST)
+        message.add_int(self.remote_chanid)
+        message.add_int(committed)
+        try:
+            self.transport._send_user_message(message)
+        except BaseException:
+            if capacity is not None:
+                capacity.rollback_committed_adjustment(
+                    self.chanid, committed
+                )
+            else:
+                self._in_window_remaining = max(
+                    0, self._in_window_remaining - committed
+                )
+            raise
 
     def _wait_for_send_window(self, size):
         """
