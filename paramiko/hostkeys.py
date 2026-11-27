@@ -21,10 +21,23 @@ from base64 import encodebytes, decodebytes
 import binascii
 import os
 import re
+import stat
+import tempfile
+import threading
 
 from collections.abc import MutableMapping
+from contextlib import contextmanager
 from hashlib import sha1
 from hmac import HMAC
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 
 from paramiko.pkey import PKey, UnknownKeyType
@@ -210,18 +223,74 @@ class HostKeys(MutableMapping):
         Return True if the given key is associated with the given hostname
         in this dictionary.
 
+        Any matching entry counts: a host may legitimately have several
+        keys of the same type trusted at once, e.g. the old and new key
+        of a server that is rotating its host key, so this returns
+        ``True`` if *any* entry for the host holds exactly this key.
+
         :param str hostname: hostname (or IP) of the SSH server
         :param .PKey key: the key to check
         :return:
             ``True`` if the key is associated with the hostname; else ``False``
         """
-        k = self.lookup(hostname)
-        if k is None:
+        for e in self._entries:
+            if e.key is None:
+                continue
+            if not self._hostname_matches(hostname, e):
+                continue
+            if e.key.get_name() != key.get_name():
+                continue
+            if e.key.asbytes() == key.asbytes():
+                return True
+        return False
+
+    def add_if_absent(self, hostname, key, storage_name=None):
+        """
+        Add a host key entry for ``hostname`` unless this exact key is
+        already trusted for that host.  Unlike `add`, this never
+        replaces an existing entry, so old and new keys of the same key
+        type remain trusted side by side (as needed during a host-key
+        rotation overlap).
+
+        :param str hostname:
+            the cleartext hostname (or IP), used to find existing
+            entries for de-duplication
+        :param .PKey key: the key to add
+        :param str storage_name:
+            the name written into the new entry; defaults to
+            ``hostname``.  Pass ``HostKeys.hash_host(hostname)`` to
+            store a hashed name when the rest of the user's file uses
+            hashed hostnames.
+        :return: ``True`` if a new entry was added, ``False`` if the
+            key was already present
+
+        .. versionadded:: 3.6
+        """
+        if self.check(hostname, key):
             return False
-        host_key = k.get(key.get_name(), None)
-        if host_key is None:
-            return False
-        return host_key.asbytes() == key.asbytes()
+        self._entries.append(HostKeyEntry([storage_name or hostname], key))
+        return True
+
+    def matching_entry(self, hostname, key):
+        """
+        Return the first `.HostKeyEntry` that trusts ``key`` for
+        ``hostname`` -- i.e. the entry that would authenticate this
+        host/key pair -- or ``None`` if there is no such entry.
+
+        :param str hostname: hostname (or IP) of the SSH server
+        :param .PKey key: the key to look up
+        :return: a `.HostKeyEntry` or ``None``
+
+        .. versionadded:: 3.6
+        """
+        for e in self._entries:
+            if e.key is None:
+                continue
+            if not self._hostname_matches(hostname, e):
+                continue
+            if e.key.asbytes() == key.asbytes():
+                return e
+        return None
 
     def clear(self):
         """
@@ -382,3 +451,177 @@ class HostKeyEntry:
 
     def __repr__(self):
         return "<HostKeyEntry {!r}: {!r}>".format(self.hostnames, self.key)
+
+
+# ---------------------------------------------------------------------
+# Atomic, merge-based updates of known_hosts files
+#
+# The trusted set is represented as the on-disk known_hosts file plus
+# the in-memory `.HostKeys` a client publishes to its handshake check.
+# New keys only become trusted (published to memory) after they have
+# been committed to disk, so anything the connection check accepts is
+# always also present in the file.
+#
+# Commits are read-modify-write cycles of the form: lock -> re-read the
+# current file -> merge (append only what is genuinely new) ->
+# atomically replace.  The lock is only held for this short critical
+# section, never across the network round trip of a host-key proof; the
+# re-read at commit time is what makes that safe, because keys another
+# client committed while we were proving are simply found already
+# present and skipped.  Merging is additive-only, so a later committer
+# can never overwrite an earlier committer's increments, whether they
+# concern the same host or unrelated hosts.
+# ---------------------------------------------------------------------
+
+# Process-local locks keyed by absolute path, serializing learners
+# living in the same process (the advisory file lock below covers other
+# processes).
+_known_hosts_locks = {}
+_known_hosts_locks_guard = threading.Lock()
+
+
+def _process_lock_for(filename):
+    key = os.path.abspath(filename)
+    with _known_hosts_locks_guard:
+        lock = _known_hosts_locks.get(key)
+        if lock is None:
+            lock = _known_hosts_locks[key] = threading.Lock()
+        return lock
+
+
+@contextmanager
+def _advisory_file_lock(filename):
+    """
+    Cross-process advisory lock guarding read-modify-write cycles on
+    ``filename``.  A stable sidecar (``<filename>.lock``) is used so
+    that atomically replacing the data file does not swap the inode
+    waiters are queued on.  Degrades to a no-op on platforms without
+    ``fcntl``/``msvcrt`` (the process-local lock still applies).
+    """
+    fd = os.open(filename + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        elif msvcrt is not None:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        yield
+    finally:
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            elif msvcrt is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            os.close(fd)
+
+
+def _parse_known_hosts(data):
+    """
+    Build a `.HostKeys` from raw known_hosts file bytes, skipping
+    comments and unparseable lines exactly like `.HostKeys.load` does.
+    """
+    hostkeys = HostKeys()
+    text = data.decode("utf-8", "replace")
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if (len(line) == 0) or (line[0] == "#"):
+            continue
+        try:
+            entry = HostKeyEntry.from_line(line, lineno)
+        except SSHException:
+            continue
+        if entry is not None:
+            hostkeys._entries.append(entry)
+    return hostkeys
+
+
+def _atomic_append(filename, current, new_lines):
+    """
+    Write ``current`` plus ``new_lines`` to ``filename`` atomically:
+    render to a temp file in the same directory, fsync, then
+    ``os.replace``.  On any failure the temp file is removed and the
+    original file (and its bytes) is left untouched.
+    """
+    directory = os.path.dirname(os.path.abspath(filename))
+    fd, tmp = tempfile.mkstemp(prefix=".known_hosts-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(current)
+            if current and not current.endswith(b"\n"):
+                f.write(b"\n")
+            for line in new_lines:
+                f.write(line.encode("utf-8"))
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            mode = stat.S_IMODE(os.stat(filename).st_mode)
+        except OSError:
+            # New file: keep it private like the rest of ~/.ssh.
+            mode = 0o600
+        os.chmod(tmp, mode)
+        os.replace(tmp, filename)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def update_known_hosts_file(filename, additions):
+    """
+    Atomically merge newly learned host keys into a known_hosts file.
+
+    The file is re-read under an advisory lock at commit time, and each
+    addition is re-checked against what is on disk *now*: keys that are
+    already present (e.g. committed by another client while we were
+    verifying proofs) are skipped, so repeated announcements never
+    create duplicate entries.  Existing file content is preserved byte
+    for byte -- comments, other hosts, and combined multi-host lines
+    included -- and genuinely new keys are appended as individual
+    single-host lines, so other hosts on a combined line never gain the
+    new keys.
+
+    :param str filename: path of the known_hosts file to update
+    :param additions:
+        an iterable of ``(hostname, storage_name, key)`` tuples, where
+        ``hostname`` is the cleartext host name used for
+        de-duplication, ``storage_name`` is the name written to the
+        file (which may be a hashed ``|1|...`` name), and ``key`` is a
+        `.PKey`
+    :return:
+        the list of ``(storage_name, key)`` pairs actually appended
+        (empty when everything was already present)
+    :raises: ``IOError`` --
+        if the updated file could not be written; the original file is
+        left unmodified in that case
+
+    .. versionadded:: 3.6
+    """
+    additions = list(additions)
+    if not additions:
+        return []
+    lock = _process_lock_for(filename)
+    with lock, _advisory_file_lock(filename):
+        try:
+            with open(filename, "rb") as f:
+                current = f.read()
+        except FileNotFoundError:
+            current = b""
+        # Re-verify against the committed trusted set: another learner
+        # may have committed some of these keys since our proofs were
+        # checked.
+        committed = _parse_known_hosts(current)
+        fresh = []
+        for hostname, storage_name, key in additions:
+            if not committed.check(hostname, key):
+                fresh.append((storage_name, key))
+        if not fresh:
+            return []
+        new_lines = [
+            "{} {} {}\n".format(storage_name, key.get_name(), key.get_base64())
+            for storage_name, key in fresh
+        ]
+        _atomic_append(filename, current, new_lines)
+        return fresh

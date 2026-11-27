@@ -34,7 +34,7 @@ from paramiko.config import SSH_PORT
 from paramiko.dsskey import DSSKey
 from paramiko.ecdsakey import ECDSAKey
 from paramiko.ed25519key import Ed25519Key
-from paramiko.hostkeys import HostKeys
+from paramiko.hostkeys import HostKeys, update_known_hosts_file
 from paramiko.rsakey import RSAKey
 from paramiko.ssh_exception import (
     SSHException,
@@ -76,6 +76,13 @@ class SSHClient(ClosingContextManager):
         self._policy = RejectPolicy()
         self._transport = None
         self._agent = None
+        # Set by connect(): whether this connection's handshake host key
+        # was already trusted via previously loaded host keys (as
+        # opposed to e.g. being accepted on first use by AutoAddPolicy),
+        # and the known_hosts name ([host]:port aware) it was checked
+        # against.
+        self._handshake_key_trusted = False
+        self._server_hostkey_name = None
 
     def load_system_host_keys(self, filename=None):
         """
@@ -141,14 +148,10 @@ class SSHClient(ClosingContextManager):
         if self._host_keys_filename is not None:
             self.load_host_keys(self._host_keys_filename)
 
-        with open(filename, "w") as f:
-            for hostname, keys in self._host_keys.items():
-                for keytype, key in keys.items():
-                    f.write(
-                        "{} {} {}\n".format(
-                            hostname, keytype, key.get_base64()
-                        )
-                    )
+        # Save per-entry (not per host+type) so that hosts with several
+        # trusted keys of the same type -- e.g. learned during a host-key
+        # rotation overlap -- are all written out.
+        self._host_keys.save(filename)
 
     def get_host_keys(self):
         """
@@ -158,6 +161,129 @@ class SSHClient(ClosingContextManager):
         :return: the local host keys as a `.HostKeys` object.
         """
         return self._host_keys
+
+    def _check_known_server_key(self, server_hostkey_name, server_key):
+        """
+        Whether ``server_key`` is currently trusted for
+        ``server_hostkey_name`` by the system or local host keys.  Any
+        matching entry counts, so the old and new keys of a server that
+        is rotating its host key are all accepted during the overlap
+        period.
+        """
+        return self._system_host_keys.check(
+            server_hostkey_name, server_key
+        ) or self._host_keys.check(server_hostkey_name, server_key)
+
+    def learn_host_keys(self):
+        """
+        Learn additional host keys from the connected server, using the
+        OpenSSH ``hostkeys-00@openssh.com`` and
+        ``hostkeys-prove-00@openssh.com`` extensions (the protocol
+        behind OpenSSH's ``UpdateHostKeys``).  This allows a client to
+        pick up a server's *new* host key over a connection that is
+        still anchored in the *old* one, smoothing host-key rotation.
+
+        This is the opt-in entry point for host-key learning: nothing
+        is learned unless this method is called, and it only proceeds
+        when
+
+        * this client's connection completed user authentication, and
+        * the host key used for this connection's handshake was already
+          trusted via previously loaded host keys (system or local).  A
+          key accepted on first use via `.AutoAddPolicy` does *not*
+          qualify as a starting point.
+
+        The server must prove possession of each announced private key;
+        the proofs are bound to this session and each key, and the
+        whole batch is rejected if any proof is missing, invalid, or
+        replayed from another session.  Learning only ever *adds* keys
+        -- existing keys are never removed -- and new keys are scoped
+        to exactly the host (and non-default port) of this connection;
+        other hosts sharing a combined known_hosts line are unaffected.
+        If the entry that authenticated this connection stores a hashed
+        hostname, the new keys are stored hashed as well.
+
+        When a local host-keys file is associated with this client (via
+        `load_host_keys`), learned keys are merged into that file
+        atomically and under a lock -- concurrent learners do not lose
+        each other's updates -- and only become trusted by this client
+        once the file update has been committed, so the in-memory trust
+        set never runs ahead of what is on disk.  The system host-keys
+        file is never modified.  Without an associated file, keys are
+        learned into the in-memory `.HostKeys` only.
+
+        :return:
+            a list of the newly trusted `.PKey` objects (empty if the
+            server announced nothing new)
+        :raises SSHException:
+            if learning is not allowed for this connection (not
+            connected, handshake key not pre-trusted, or authentication
+            not completed)
+        :raises HostKeyProofError:
+            if the server's proofs are missing or invalid; nothing is
+            learned in that case
+        :raises IOError:
+            if the learned keys could not be committed to the local
+            host-keys file; nothing is learned in that case either
+
+        .. versionadded:: 3.6
+        """
+        if self._transport is None or not self._transport.is_active():
+            raise SSHException("not connected; cannot learn host keys")
+        if not self._handshake_key_trusted:
+            raise SSHException(
+                "refusing to learn host keys: this connection's "
+                "handshake key was not trusted via previously loaded "
+                "known_hosts"
+            )
+        if not self._transport.is_authenticated():
+            raise SSHException(
+                "refusing to learn host keys: authentication not complete"
+            )
+        hostname = self._server_hostkey_name
+        announced = self._transport.get_announced_host_keys()
+        candidates = [
+            key
+            for key in announced
+            if not self._check_known_server_key(hostname, key)
+        ]
+        if not candidates:
+            return []
+        # All-or-nothing: any proof failure rejects the entire batch.
+        proven = self._transport.prove_host_keys(candidates)
+        # Store hashed if and only if the entry that authenticated this
+        # connection stores a hashed hostname.
+        handshake_key = self._transport.get_remote_server_key()
+        entry = self._system_host_keys.matching_entry(hostname, handshake_key)
+        if entry is None:
+            entry = self._host_keys.matching_entry(hostname, handshake_key)
+        hashed = entry is not None and not any(
+            h == hostname for h in entry.hostnames
+        )
+        storage_name = HostKeys.hash_host(hostname) if hashed else hostname
+        if self._host_keys_filename is not None:
+            # Commit to disk first (merged, under a lock, with whatever
+            # other clients committed in the meantime), and only then
+            # publish to the in-memory trusted set: a key is never
+            # trusted before it is on disk.
+            update_known_hosts_file(
+                self._host_keys_filename,
+                [(hostname, storage_name, key) for key in proven],
+            )
+        learned = []
+        for key in proven:
+            if self._host_keys.add_if_absent(hostname, key, storage_name):
+                learned.append(key)
+        for key in learned:
+            self._log(
+                DEBUG,
+                "Learned {} host key for {}: {}".format(
+                    key.get_name(),
+                    hostname,
+                    hexlify(key.get_fingerprint()),
+                ),
+            )
+        return learned
 
     def set_log_channel(self, name):
         """
@@ -453,6 +579,7 @@ class SSHClient(ClosingContextManager):
         # If GSS-API Key Exchange is performed we are not required to check the
         # host key, because the host is authenticated via GSS-API / SSPI as
         # well as our client.
+        self._handshake_key_trusted = False
         if not self._transport.gss_kex_used:
             server_key = t.get_remote_server_key()
             if our_server_keys is None:
@@ -461,11 +588,18 @@ class SSHClient(ClosingContextManager):
                     self, server_hostkey_name, server_key
                 )
             else:
-                our_key = our_server_keys.get(server_key.get_name())
-                if our_key != server_key:
+                if not self._check_known_server_key(
+                    server_hostkey_name, server_key
+                ):
+                    our_key = our_server_keys.get(server_key.get_name())
                     if our_key is None:
                         our_key = list(our_server_keys.values())[0]
                     raise BadHostKeyException(hostname, server_key, our_key)
+                # The handshake key was trusted via previously loaded
+                # host keys; only such a connection may be used to learn
+                # further host keys (see `learn_host_keys`).
+                self._handshake_key_trusted = True
+        self._server_hostkey_name = server_hostkey_name
 
         if username is None:
             username = getpass.getuser()

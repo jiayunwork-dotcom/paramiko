@@ -248,3 +248,22 @@ class MessageOrderError(SSHException):
     """
 
     pass
+
+
+class HostKeyProofError(SSHException):
+    """
+    A server failed to prove possession of the private half of an
+    announced host key (OpenSSH ``hostkeys-prove-00@openssh.com``
+    extension).
+
+    This is raised when the server refuses the proof request, returns a
+    number of signatures that does not match the number of keys
+    submitted, or returns a signature that does not verify against the
+    current session (e.g. a tampered or cross-session replayed proof).
+    Whenever it is raised, the entire batch of announced keys is
+    rejected: none of them becomes trusted.
+
+    .. versionadded:: 3.6
+    """
+
+    pass

@@ -116,6 +116,7 @@ from paramiko.receive_capacity import (
     ChannelWindowOverflow,
 )
 from paramiko.primes import ModulusPack
+from paramiko.pkey import PKey
 from paramiko.rsakey import RSAKey
 from paramiko.ecdsakey import ECDSAKey
 from paramiko.server import ServerInterface
@@ -123,6 +124,7 @@ from paramiko.sftp_client import SFTPClient
 from paramiko.ssh_exception import (
     BadAuthenticationType,
     ChannelException,
+    HostKeyProofError,
     IncompatiblePeer,
     MessageOrderError,
     ProxyCommandFailure,
@@ -687,6 +689,11 @@ class Transport(threading.Thread, ClosingContextManager):
         self.server_accepts = []
         self.server_accept_cv = threading.Condition(self.lock)
         self.subsystem_table = {}
+
+        # client mode: host keys announced by the server via the OpenSSH
+        # "hostkeys-00@openssh.com" extension.  These are NOT trusted in
+        # any way by themselves; see `get_announced_host_keys`.
+        self._announced_host_keys = []
 
         # Handler table, now set at init time for easier per-instance
         # manipulation and subclass twiddling.
@@ -1544,6 +1551,85 @@ class Transport(threading.Thread, ClosingContextManager):
             if self.completion_event.is_set():
                 break
         return self.global_response
+
+    def get_announced_host_keys(self):
+        """
+        Return the host keys the server announced via the OpenSSH
+        ``hostkeys-00@openssh.com`` extension (sent by supporting
+        servers after authentication completes), as a list of `.PKey`
+        objects.  The list is empty if no announcement has been
+        received.
+
+        .. warning::
+            An announcement by itself is *not* a proof: these keys must
+            not be trusted until the server has proven possession of
+            the private halves, e.g. via `prove_host_keys`.
+
+        .. versionadded:: 3.6
+        """
+        return list(self._announced_host_keys)
+
+    def prove_host_keys(self, keys):
+        """
+        Ask the server to prove possession of the private halves of
+        ``keys``, using the OpenSSH ``hostkeys-prove-00@openssh.com``
+        extension, and verify the proofs.
+
+        Each proof is a signature, made with the corresponding private
+        key, over the extension name, this connection's session ID, and
+        the public key blob -- so a proof is bound to this session and
+        to that specific key, and cannot be replayed from another
+        session or transplanted onto a different key.
+
+        Verification is all-or-nothing: unless every key is proven, a
+        `.HostKeyProofError` is raised and none of the keys should be
+        considered verified.
+
+        :param keys:
+            an iterable of `.PKey` objects to prove (typically a subset
+            of `get_announced_host_keys`)
+        :return:
+            the list of verified `.PKey` objects (equal to ``keys``)
+        :raises HostKeyProofError:
+            if the server refuses the request, returns a number of
+            signatures that does not match the number of keys, or any
+            signature fails to verify against this session
+
+        .. versionadded:: 3.6
+        """
+        keys = list(keys)
+        if not keys:
+            return []
+        if self.session_id is None:
+            raise HostKeyProofError(
+                "cannot verify host key proofs: no session ID"
+            )
+        response = self.global_request(
+            "hostkeys-prove-00@openssh.com",
+            tuple(key.asbytes() for key in keys),
+            wait=True,
+        )
+        if response is None:
+            raise HostKeyProofError("server refused hostkeys-prove request")
+        signatures = []
+        while len(response.get_remainder()) > 0:
+            signatures.append(response.get_string())
+        if len(signatures) != len(keys):
+            raise HostKeyProofError(
+                "expected {} host key proof(s), got {}".format(
+                    len(keys), len(signatures)
+                )
+            )
+        for key, sig in zip(keys, signatures):
+            proof = Message()
+            proof.add_string("hostkeys-prove-00@openssh.com")
+            proof.add_string(self.session_id)
+            proof.add_string(key.asbytes())
+            if not key.verify_ssh_sig(bytes(proof), Message(sig)):
+                raise HostKeyProofError(
+                    "host key proof failed for {}".format(key.get_name())
+                )
+        return keys
 
     def accept(self, timeout=None):
         """
@@ -3169,11 +3255,14 @@ class Transport(threading.Thread, ClosingContextManager):
         self._log(DEBUG, 'Received global request "{}"'.format(kind))
         want_reply = m.get_boolean()
         if not self.server_mode:
-            self._log(
-                DEBUG,
-                'Rejecting "{}" global request from server.'.format(kind),
-            )
-            ok = False
+            if kind == "hostkeys-00@openssh.com":
+                ok = self._process_hostkeys_announcement(m)
+            else:
+                self._log(
+                    DEBUG,
+                    'Rejecting "{}" global request from server.'.format(kind),
+                )
+                ok = False
         elif kind == "tcpip-forward":
             address = m.get_text()
             port = m.get_int()
@@ -3199,6 +3288,33 @@ class Transport(threading.Thread, ClosingContextManager):
             else:
                 msg.add_byte(cMSG_REQUEST_FAILURE)
             self._send_message(msg)
+
+    def _process_hostkeys_announcement(self, m):
+        """
+        Handle an OpenSSH ``hostkeys-00@openssh.com`` global request,
+        with which a server advertises all of its host keys after
+        authentication.  The announced keys are stored for retrieval
+        via `get_announced_host_keys`; they are not trusted by
+        themselves.
+        """
+        keys = []
+        try:
+            while len(m.get_remainder()) > 0:
+                blob = m.get_string()
+                try:
+                    key_type = Message(blob).get_text()
+                    keys.append(PKey.from_type_string(key_type, blob))
+                except Exception:
+                    self._log(DEBUG, "Skipping unparseable announced host key")
+        except Exception as e:
+            self._log(
+                DEBUG,
+                "Ignoring malformed host keys announcement: {}".format(e),
+            )
+            return False
+        self._announced_host_keys = keys
+        self._log(DEBUG, "Server announced {} host key(s)".format(len(keys)))
+        return True
 
     def _parse_request_success(self, m):
         self._log(DEBUG, "Global request successful.")
