@@ -63,6 +63,12 @@ from paramiko.ssh_exception import (
 from paramiko.util import b, u
 
 
+# Sentinel for "a certificate was presented but failed validation"; distinct
+# from None (bare public key, original behavior) and from a parsed
+# OpenSSHCertificate (validated, ready for the callback).
+_CERTIFICATE_REJECTED = object()
+
+
 class AuthHandler:
     """
     Internal class to handle the mechanics of authentication.
@@ -256,6 +262,72 @@ class AuthHandler:
             self._log(INFO, err.format(algorithm))
             return None
         return self.transport._key_info[algorithm](Message(keyblob))
+
+    def _validate_certificate_request(self, username, algorithm, key):
+        """
+        Validate an OpenSSH user certificate presented during pubkey auth.
+
+        Returns:
+
+        - ``None`` for a plain (non-certificate) public key, which keeps the
+          original bare-key callback behavior;
+        - a parsed `.OpenSSHCertificate` when validation succeeds;
+        - the ``_CERTIFICATE_REJECTED`` sentinel when a certificate was
+          presented but did not pass every check.
+
+        The checks performed here, all before the application's public-key
+        callback runs:
+
+        - the presented key actually carries a certificate blob;
+        - a `.CertificateValidator` (trusted CA store) is configured on the
+          transport -- otherwise certificates are rejected, never accepted
+          as bare keys;
+        - it is a user certificate, signed by a trusted CA using a signature
+          algorithm matching that CA's key;
+        - it is currently valid and lists the requested username as an exact
+          principal;
+        - all its critical options are ones Paramiko can account for.
+        """
+        from paramiko.certificate import (
+            CertificateError,
+            OpenSSHCertificate,
+        )
+
+        public_blob = getattr(key, "public_blob", None)
+        # Plain public key: existing behavior, no certificate validation.
+        if public_blob is None or not public_blob.key_type.endswith(
+            "-cert-v01@openssh.com"
+        ):
+            return None
+        validator = self.transport.certificate_validator
+        if validator is None:
+            self._log(
+                INFO,
+                "Auth rejected: client presented a certificate but no "
+                "trusted CA validator is configured",
+            )
+            return _CERTIFICATE_REJECTED
+        # Parse from the same blob the key object was built from, so the
+        # validated object and anything handed to the callback cannot diverge.
+        try:
+            certificate = OpenSSHCertificate.from_public_blob(public_blob)
+            certificate = validator.validate(certificate, username)
+        except CertificateError as e:
+            self._log(
+                INFO,
+                "Auth rejected: certificate validation failed: {}".format(e),
+            )
+            return _CERTIFICATE_REJECTED
+        self._log(
+            INFO,
+            "Certificate {!r} validated for principal {!r} against "
+            "CA {}".format(
+                certificate.key_id,
+                username,
+                certificate.signing_ca.get_name(),
+            ),
+        )
+        return certificate
 
     def _finalize_pubkey_algorithm(self, key_type):
         """
@@ -489,10 +561,28 @@ class AuthHandler:
             if key is None:
                 self._disconnect_no_more_auth()
                 return
-            # first check if this key is okay... if not, we can skip the verify
-            result = self.transport.server_object.check_auth_publickey(
-                username, key
+            # Certificate-bearing requests must pass full CA-level
+            # validation before any application callback sees them. A request
+            # that fails (or arrives at a transport with no trust store
+            # configured) is a normal authentication failure, never a
+            # fallback to the bare public-key callback.
+            certificate = self._validate_certificate_request(
+                username=username, algorithm=algorithm, key=key
             )
+            if certificate is _CERTIFICATE_REJECTED:
+                result = AUTH_FAILED
+            else:
+                # For certs, expose the exact parsed object that was
+                # validated, so the callback cannot re-interpret the raw blob
+                # differently. Bare keys get no attribute (and keep their
+                # original callback behavior).
+                if certificate is not None:
+                    key.certificate = certificate
+                # first check if this key is okay... if not, we can skip the
+                # verify
+                result = self.transport.server_object.check_auth_publickey(
+                    username, key
+                )
             if result != AUTH_FAILED:
                 # key is okay, verify it
                 if not sig_attached:
@@ -508,7 +598,20 @@ class AuthHandler:
                 blob = self._get_session_blob(
                     key, service, username, algorithm
                 )
-                if not key.verify_ssh_sig(blob, sig):
+                try:
+                    signature_ok = key.verify_ssh_sig(blob, sig)
+                except Exception as e:
+                    # A mangled or algorithm-incompatible signature must
+                    # never crash auth; it is simply a failed proof of
+                    # possession.
+                    self._log(
+                        INFO,
+                        "Auth rejected: error verifying signature: {}".format(
+                            e
+                        ),
+                    )
+                    signature_ok = False
+                if not signature_ok:
                     self._log(INFO, "Auth rejected: invalid signature")
                     result = AUTH_FAILED
         elif method == "keyboard-interactive":

@@ -4,6 +4,30 @@ Changelog
 
 - :release:`5.1.0 <2026-10-17>`
 - :release:`5.0.1 <2026-10-17>`
+- :feature:`-` Added full server-side validation of OpenSSH user
+  certificates (``*-cert-v01@openssh.com``) via the new
+  `paramiko.certificate` module. Previously a certificate presented to a
+  Paramiko server was treated as an opaque blob around the underlying public
+  key, with no verification of the CA signature, principals or validity, so
+  certificate users had to fall back to per-user bare public keys.
+
+  Configure trust with the new
+  `~paramiko.transport.Transport.set_certificate_validator` /
+  `~paramiko.transport.Transport.add_trusted_ca_key` APIs and a
+  `~paramiko.certificate.CertificateValidator` built from your trusted CA
+  public keys (or a per-username callable). The library now rejects, before
+  any application callback runs, anything that is not a user certificate, is
+  outside its validity window, does not list the requested username as an
+  exact principal, carries an unknown critical option, or fails trusted-CA
+  signature verification (including signature/CA key algorithm mismatches).
+  The single parsed `~paramiko.certificate.OpenSSHCertificate` object that was
+  validated is exposed to `check_auth_publickey
+  <paramiko.server.ServerInterface.check_auth_publickey>` as
+  ``key.certificate``, including the ``force-command`` and
+  ``source-address`` critical options, principals, validity and signing CA.
+  Proof of possession of the matching private key remains mandatory
+  afterwards, plain (non-certificate) keys keep their original behavior, and
+  the two paths no longer fall back into one another.
 - :bug:`2462` (w/ earlier fix attempts :issue:`2475` and :issue:`2465`) An API
   gap between `~paramiko.agent.AgentKey` and the other, 'concrete'
   `~paramiko.pkey.PKey` subclasses was triggering ``AttributeError`` anytime

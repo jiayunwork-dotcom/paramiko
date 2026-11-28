@@ -149,6 +149,12 @@ class PKey:
     BEGIN_TAG = re.compile(r"^-{5}BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-{5}\s*$")
     END_TAG = re.compile(r"^-{5}END (RSA|EC|OPENSSH) PRIVATE KEY-{5}\s*$")
 
+    # Parsed, server-validated OpenSSH certificate when this key was
+    # presented as part of a *-cert-v01@openssh.com auth request. None for
+    # plain keys and for client-side keys. Defined at class level so it is
+    # present even though subclasses don't call super().__init__.
+    certificate = None
+
     @staticmethod
     def from_path(path, password: Optional[str] = None):
         """
@@ -292,7 +298,10 @@ class PKey:
             if a key cannot be created from the ``data`` or ``msg`` given, or
             no key was passed in.
         """
-        pass
+        # Parsed, server-validated OpenSSH certificate when this key was
+        # presented as part of a *-cert-v01@openssh.com auth request. None
+        # for plain keys and for client-side keys.
+        self.certificate = None
 
     # TODO: arguably this might want to be __str__ instead? ehh
     # TODO: ditto the interplay between showing class name (currently we just

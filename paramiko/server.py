@@ -166,6 +166,36 @@ class ServerInterface:
         If you're willing to accept the key, Paramiko will do the work of
         verifying the client's signature.
 
+        OpenSSH user certificates (``*-cert-v01@openssh.com``) are handled
+        specially *before* this callback runs. When the client presents a
+        certificate, Paramiko first (assuming a `.CertificateValidator` was
+        configured on the transport) verifies that it is a user certificate,
+        is signed by a trusted CA using an algorithm matching that CA key, is
+        within its validity period, and lists ``username`` as an exact
+        principal; unknown critical options cause rejection as well. Only a
+        certificate that passed every one of those checks reaches this
+        callback, with the parsed `.OpenSSHCertificate` available as
+        ``key.certificate`` -- the very same object that was validated, never
+        a re-interpretation of the raw blob. You should inspect it before
+        accepting, in particular:
+
+        - ``key.certificate.critical_options`` /
+          `.OpenSSHCertificate.force_command` and
+          `.OpenSSHCertificate.source_addresses`, which carry the
+          ``force-command`` and ``source-address`` critical options. Paramiko
+          does not silently enforce these, so a certificate carrying them
+          must not be accepted unless your code honors them (e.g. via
+          `.CertificateValidator.check_source_address` and your channel
+          handling).
+        - ``key.certificate.principals``, ``valid_after`` / ``valid_before``
+          and ``key.certificate.signing_ca`` (the trusted CA that vouched for
+          it), if you need finer-grained policy.
+
+        If no validator is configured, certificate requests are rejected
+        without invoking this callback at all; they can never be accepted as
+        bare public keys. Plain (non-certificate) keys behave exactly as
+        before.
+
         The default implementation always returns ``AUTH_FAILED``.
 
         :param str username: the username of the authenticating client

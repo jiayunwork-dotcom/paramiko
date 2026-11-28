@@ -23,12 +23,15 @@ Some unit tests for SSHClient.
 import gc
 import os
 import platform
+import shutil
 import socket
+import tempfile
 import threading
 import time
 import unittest
 import warnings
 import weakref
+import base64
 from tempfile import mkstemp
 from unittest.mock import Mock, patch
 
@@ -38,11 +41,25 @@ from pytest_relaxed import raises
 import paramiko
 from paramiko import SSHClient
 from paramiko.agent import AgentKey
+from paramiko.certificate import CertificateValidator
 from paramiko.ed25519key import Ed25519Key
 from paramiko.pkey import PublicBlob, UnknownKeyType
 from paramiko.ssh_exception import AuthenticationException, SSHException
 
 from ._util import _support, slow
+
+
+def _load_ca_public_key(name):
+    """Load a test CA public key from the offline cert fixture directory."""
+    with open(_support(f"certs/{name}")) as fd:
+        key_type, b64 = fd.readline().split()[:2]
+    raw = base64.b64decode(b64)
+    if key_type == "ssh-ed25519":
+        return Ed25519Key(data=raw)
+    if key_type == "ssh-rsa":
+        return paramiko.RSAKey(data=raw)
+    return paramiko.ECDSAKey(data=raw)
+
 
 FINGERPRINTS = {
     # TODO: this should still be ok as it's specifically re: key
@@ -51,6 +68,35 @@ FINGERPRINTS = {
     "ecdsa-sha2-nistp256": b"\x25\x19\xeb\x55\xe6\xa1\x47\xff\x4f\x38\xd2\x75\x6f\xa5\xd5\x60",  # noqa
     "ssh-ed25519": b'\xb3\xd5"\xaa\xf9u^\xe8\xcd\x0e\xea\x02\xb9)\xa2\x80',
 }
+
+
+_BARE_KEY_DIRS = set()
+
+
+def _bare_key_path(name):
+    """
+    Copy a support private key into a temp directory without its sibling
+    ``-cert.pub``.
+
+    Paramiko auto-loads a certificate when one sits next to a key file; the
+    generic client connectivity tests exercise bare public-key auth, and
+    server-side certificate validation now (correctly) rejects untrusted
+    certs. These copies keep those tests focused on bare keys. Directories
+    are removed by the autouse fixture below.
+    """
+    source = _support(name)
+    target_dir = tempfile.mkdtemp(prefix="paramiko-bare-keys-")
+    _BARE_KEY_DIRS.add(target_dir)
+    target = os.path.join(target_dir, name)
+    shutil.copy(source, target)
+    return target
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_bare_key_dirs():
+    yield
+    while _BARE_KEY_DIRS:
+        shutil.rmtree(_BARE_KEY_DIRS.pop(), ignore_errors=True)
 
 
 class NullServer(paramiko.ServerInterface):
@@ -75,6 +121,20 @@ class NullServer(paramiko.ServerInterface):
         return paramiko.AUTH_FAILED
 
     def check_auth_publickey(self, username, key):
+        # A certificate that reached this callback has already been fully
+        # validated by the transport's CertificateValidator; accept it based
+        # on the validated certificate plus the optional public-blob
+        # assertion, rather than the (certificate-wrapped) fingerprint.
+        if key.certificate is not None:
+            happy = True
+            if (
+                self.__expected_public_blob is not None
+                and key.public_blob != self.__expected_public_blob
+            ):
+                happy = False
+            return (
+                paramiko.AUTH_SUCCESSFUL if happy else paramiko.AUTH_FAILED
+            )
         try:
             expected = FINGERPRINTS[key.get_name()]
         except KeyError:
@@ -176,6 +236,16 @@ class ClientTest(unittest.TestCase):
         keypath = _support("ecdsa-256.key")
         host_key = paramiko.ECDSAKey.from_private_key_file(keypath)
         self.ts.add_server_key(host_key)
+        # Trust the offline test CAs so certificates issued by them pass the
+        # library's full validation before reaching NullServer.
+        self.ts.set_certificate_validator(
+            CertificateValidator(
+                [
+                    _load_ca_public_key("test_ed25519_ca.pub"),
+                    _load_ca_public_key("test_rsa_ca.pub"),
+                ]
+            )
+        )
         server = NullServer(allowed_keys=allowed_keys, public_blob=public_blob)
         if delay:
             time.sleep(delay)
@@ -208,14 +278,15 @@ class ClientTest(unittest.TestCase):
         )
 
         # Actual connection
-        self.tc.connect(**dict(self.connect_kwargs, **kwargs))
+        effective_kwargs = dict(self.connect_kwargs, **kwargs)
+        self.tc.connect(**effective_kwargs)
 
         # Authentication successful?
         self.event.wait(1.0)
         self.assertTrue(self.event.is_set())
         self.assertTrue(self.ts.is_active())
         self.assertEqual(
-            self.connect_kwargs["username"], self.ts.get_username()
+            effective_kwargs["username"], self.ts.get_username()
         )
         self.assertEqual(True, self.ts.is_authenticated())
 
@@ -255,16 +326,16 @@ class SSHClientTest(ClientTest):
         """
         verify that SSHClient works with an RSA key.
         """
-        self._test_connection(key_filename=_support("rsa.key"))
+        self._test_connection(key_filename=_bare_key_path("rsa.key"))
 
     def test_client_ecdsa(self):
         """
         verify that SSHClient works with an ECDSA key.
         """
-        self._test_connection(key_filename=_support("ecdsa-256.key"))
+        self._test_connection(key_filename=_bare_key_path("ecdsa-256.key"))
 
     def test_client_ed25519(self):
-        self._test_connection(key_filename=_support("ed25519.key"))
+        self._test_connection(key_filename=_bare_key_path("ed25519.key"))
 
     def test_multiple_key_files(self):
         """
@@ -298,7 +369,7 @@ class SSHClientTest(ClientTest):
             try:
                 self._test_connection(
                     key_filename=[
-                        _support("{}.key".format(x)) for x in attempt
+                        _bare_key_path("{}.key".format(x)) for x in attempt
                     ],
                     allowed_keys=[types_[x] for x in accept],
                 )
@@ -326,25 +397,40 @@ class SSHClientTest(ClientTest):
         # They're similar except for which path is given; the expected auth and
         # server-side behavior is 100% identical.)
         # NOTE: only bothered whipping up one cert per overall class/family.
-        for type_ in ("rsa", "ecdsa-256", "ed25519"):
-            key_path = _support(f"{type_}.key")
+        # The username must be an exact principal embedded in each fixture
+        # certificate, since the library enforces that match.
+        for type_, username in (
+            ("rsa", "bob"),
+            ("ecdsa-256", "carol"),
+            ("ed25519", "alice"),
+        ):
+            stem = f"user_{type_}" if type_ != "ecdsa-256" else "user_ecdsa"
+            key_path = _support(f"certs/{stem}")
+            cert_path = f"{key_path}-cert.pub"
             self._test_connection(
-                key_filename=key_path,
-                public_blob=PublicBlob.from_file(f"{key_path}-cert.pub"),
+                key_filename=cert_path,
+                public_blob=PublicBlob.from_file(cert_path),
+                username=username,
             )
 
     def test_certs_implicitly_loaded_alongside_key_filename_keys(self):
-        # NOTE: a regular test_connection() w/ rsa.key would incidentally
-        # test this (because test_xxx.key-cert.pub exists) but incidental tests
+        # NOTE: a regular test_connection() w/ a key would incidentally test
+        # this (because a sibling -cert.pub exists) but incidental tests
         # stink, so NullServer and friends were updated to allow assertions
         # about the server-side key object's public blob. Thus, we can prove
         # that a specific cert was found, along with regular authorization
         # succeeding proving that the overall flow works.
-        for type_ in ("rsa", "ecdsa-256", "ed25519"):
-            key_path = _support(f"{type_}.key")
+        for type_, username in (
+            ("rsa", "bob"),
+            ("ecdsa-256", "carol"),
+            ("ed25519", "alice"),
+        ):
+            stem = f"user_{type_}" if type_ != "ecdsa-256" else "user_ecdsa"
+            key_path = _support(f"certs/{stem}")
             self._test_connection(
                 key_filename=key_path,
                 public_blob=PublicBlob.from_file(f"{key_path}-cert.pub"),
+                username=username,
             )
 
     def test_default_key_locations_trigger_cert_loads_if_found(self):

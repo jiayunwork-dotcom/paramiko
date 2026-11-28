@@ -550,6 +550,12 @@ class Transport(threading.Thread, ClosingContextManager):
         self.server_accepts = []
         self.server_accept_cv = threading.Condition(self.lock)
         self.subsystem_table = {}
+        # Optional server-side OpenSSH user certificate validator. When set,
+        # certificate-bearing pubkey auth requests are fully validated here
+        # before any server callback is allowed to accept them; when unset,
+        # certificate requests are rejected rather than being treated as bare
+        # public keys.
+        self.certificate_validator = None
 
         # Handler table, now set at init time for easier per-instance
         # manipulation and subclass twiddling.
@@ -794,6 +800,51 @@ class Transport(threading.Thread, ClosingContextManager):
         if isinstance(key, RSAKey):
             self.server_key_dict["rsa-sha2-256"] = key
             self.server_key_dict["rsa-sha2-512"] = key
+
+    def set_certificate_validator(self, validator):
+        """
+        Configure server-side validation of OpenSSH user certificates.
+
+        When a validator is set and a client authenticates with a
+        ``*-cert-v01@openssh.com`` public key, Paramiko fully validates the
+        certificate (user-certificate type, trusted CA signature with a
+        matching algorithm, validity period, exact principal match and known
+        critical options) *before* invoking any server callback.  The parsed
+        `.OpenSSHCertificate` is then attached to the presented `.PKey` as
+        ``key.certificate`` and passed to
+        `.ServerInterface.check_auth_publickey`.
+
+        Without a configured validator, certificate-bearing requests are
+        rejected outright; they never fall through to the bare-public-key
+        path, so an unvalidated certificate cannot be accepted as if it were
+        a raw key.
+
+        :param .CertificateValidator validator:
+            the validator (typically built from your trusted CA public keys)
+        """
+        self.certificate_validator = validator
+
+    def add_trusted_ca_key(self, ca_key):
+        """
+        Add a trusted CA public key for server-side certificate validation.
+
+        Repeated calls extend the trust store; the first call also installs a
+        default `.CertificateValidator` on this transport.  For per-user CA
+        selection, or full control over validation (e.g. a custom clock),
+        configure a validator directly with `set_certificate_validator`.
+
+        :param .PKey ca_key:
+            a trusted CA public key (such as one loaded from a
+            ``ca.pub`` file)
+        """
+        from paramiko.certificate import CertificateValidator
+
+        validator = self.certificate_validator
+        if not isinstance(validator, CertificateValidator):
+            validator = CertificateValidator()
+            self.set_certificate_validator(validator)
+        validator._static_cas = validator._static_cas + (ca_key,)
+        return validator
 
     def get_server_key(self):
         """

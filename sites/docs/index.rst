@@ -49,6 +49,7 @@ Authentication & keys
 .. toctree::
     api/auth
     api/agent
+    api/certificate
     api/hostkeys
     api/keys
 
